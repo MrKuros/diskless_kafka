@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Data and binaries
+data/
+minio
+*.log
+*.sqlite
+.DS_Store
