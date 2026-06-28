@@ -31,6 +31,8 @@ from protocol import (
     build_join_group_response,
     build_metadata_response,
     build_produce_response,
+    build_sync_group_response,
+    encode_member_assignment,
     parse_metadata_request_topics,
     parse_produce_request,
     parse_record_batch_header,
@@ -149,6 +151,9 @@ def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
 
     if header.api_key == 11:  # JoinGroup
         return _handle_join_group(header, payload)
+
+    if header.api_key == 14:  # SyncGroup
+        return _handle_sync_group(header, payload)
 
     return None
 
@@ -420,6 +425,107 @@ def _handle_join_group(header: RequestHeader, payload: bytes) -> bytes | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# SyncGroup handler  (API key 14)
+# ---------------------------------------------------------------------------
+
+def _handle_sync_group(header: RequestHeader, payload: bytes) -> bytes | None:
+    """
+    Handle a SyncGroup request.
+
+    The group leader sends a group_assignment array (one entry per member).
+    Each entry maps a member_id to a ConsumerProtocolAssignment blob.
+    Followers send an empty group_assignment array.
+
+    We:
+    1. Parse the request.
+    2. If this member sent assignments (i.e. it's the leader), store them
+       in GROUP_STATE under the group.
+    3. Look up and return the assignment for this specific member_id.
+    """
+    body = payload[header.header_size:]
+    pos  = 0
+
+    def rd_str() -> str:
+        nonlocal pos
+        n = struct.unpack_from(">h", body, pos)[0]; pos += 2
+        if n < 0:
+            return ""
+        s = body[pos: pos + n].decode("utf-8"); pos += n
+        return s
+
+    def rd_i32() -> int:
+        nonlocal pos
+        v = struct.unpack_from(">i", body, pos)[0]; pos += 4; return v
+
+    def rd_bytes() -> bytes:
+        nonlocal pos
+        n = struct.unpack_from(">i", body, pos)[0]; pos += 4
+        if n < 0:
+            return b""
+        b_ = body[pos: pos + n]; pos += n
+        return bytes(b_)
+
+    # ── Parse request body ────────────────────────────────────────────────
+    group_id      = rd_str()
+    generation_id = rd_i32()
+    member_id     = rd_str()
+    if header.api_version >= 3:
+        _group_instance_id = rd_str()   # nullable, ignore
+
+    assignment_count = rd_i32()
+    received_assignments: dict[str, bytes] = {}
+    for _ in range(assignment_count):
+        mid      = rd_str()
+        metadata = rd_bytes()
+        received_assignments[mid] = metadata
+
+    # ── Store assignments if this is the leader sending them ──────────────
+    grp = GROUP_STATE.get(group_id)
+    if grp is None:
+        log.warning("SyncGroup: unknown group %r — returning error", group_id)
+        return build_sync_group_response(
+            correlation_id=header.correlation_id,
+            api_version=header.api_version,
+            error_code=15,   # COORDINATOR_NOT_AVAILABLE
+            member_assignment_bytes=b"",
+        )
+
+    if received_assignments:
+        # This is the leader: store the raw assignment bytes per member.
+        # Each value is a ConsumerProtocolAssignment blob as sent by the client.
+        grp["assignments"] = received_assignments
+        log.info(
+            "SyncGroup: leader %r stored assignments for %d member(s) in group %r",
+            member_id, len(received_assignments), group_id,
+        )
+
+    # ── Return this member's assignment ───────────────────────────────────
+    assignments = grp.get("assignments", {})
+    my_assignment_bytes = assignments.get(member_id, b"")
+
+    if not my_assignment_bytes:
+        # Fallback: no assignment stored yet (shouldn't happen in single-member
+        # case, but be safe). Give the member an empty assignment.
+        my_assignment_bytes = encode_member_assignment({})
+        log.warning(
+            "SyncGroup: no assignment found for member %r in group %r — "
+            "returning empty assignment",
+            member_id, group_id,
+        )
+    else:
+        log.info(
+            "SyncGroup ← group=%r generation=%d member=%r "
+            "assignment=%d bytes",
+            group_id, generation_id, member_id, len(my_assignment_bytes),
+        )
+
+    return build_sync_group_response(
+        correlation_id=header.correlation_id,
+        api_version=header.api_version,
+        error_code=0,
+        member_assignment_bytes=my_assignment_bytes,
+    )
 
 
 def _handle_produce(header: RequestHeader, payload: bytes) -> bytes | None:

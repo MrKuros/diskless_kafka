@@ -232,6 +232,7 @@ SUPPORTED_APIS: list[tuple[int, int, int]] = [
     (3,  0,  5),  # Metadata         — Day 4  (v5 → ≥1.0.0 detection)
     (10, 0,  0),  # FindCoordinator  — Day 8  (v0 is all kafka-python needs)
     (11, 0,  1),  # JoinGroup        — Day 9  (v1 adds rebalance_timeout)
+    (14, 0,  1),  # SyncGroup        — Day 10 (v1 adds throttle_time_ms)
     (18, 0,  0),  # ApiVersions      — Day 3
 ]
 
@@ -968,6 +969,68 @@ def build_join_group_response(
             body += struct.pack(">h", -1)               # group_instance_id null
         # metadata BYTES: INT32 length prefix + raw bytes
         body += struct.pack(">i", len(metadata)) + metadata
+
+    return build_frame(resp_header + body)
+
+
+# ---------------------------------------------------------------------------
+# SyncGroup helpers & response builder  (API key 14)
+# ---------------------------------------------------------------------------
+# The SyncGroup response carries a single BYTES field: member_assignment.
+# Those bytes are NOT a raw blob from the request — they are a serialized
+# ConsumerProtocolAssignment structure:
+#
+#   version         INT16           (always 0)
+#   partitions      ARRAY
+#     topic         STRING
+#     partitions    ARRAY INT32
+#   user_data       BYTES (nullable, use -1 = null)
+#
+# This nested structure is wrapped with an INT32 length prefix to form the
+# BYTES field in the outer response.
+
+def encode_member_assignment(topic_partitions: dict[str, list[int]]) -> bytes:
+    """
+    Encode a {topic: [partition, ...]} map into the Kafka
+    ConsumerProtocolAssignment binary format (version 0).
+
+    Returns the raw bytes (without the INT32 length prefix —
+    the caller wraps them into a BYTES field).
+    """
+    buf = struct.pack(">h", 0)                      # version INT16 = 0
+    buf += struct.pack(">i", len(topic_partitions)) # topic array count
+    for topic, parts in topic_partitions.items():
+        topic_b = topic.encode("utf-8")
+        buf += struct.pack(">h", len(topic_b)) + topic_b   # topic STRING
+        buf += struct.pack(">i", len(parts))               # partition array count
+        for p in parts:
+            buf += struct.pack(">i", p)                    # partition INT32
+    buf += struct.pack(">i", -1)                    # user_data BYTES = null
+    return buf
+
+
+def build_sync_group_response(
+    correlation_id: int,
+    api_version:    int,
+    error_code:     int,
+    member_assignment_bytes: bytes,  # pre-encoded ConsumerProtocolAssignment
+) -> bytes:
+    """
+    Build a framed SyncGroup response.
+
+    v0: error_code | member_assignment (BYTES)
+    v1+: throttle_time_ms | error_code | member_assignment (BYTES)
+    """
+    resp_header = struct.pack(">i", correlation_id)
+    body = b""
+
+    if api_version >= 1:
+        body += struct.pack(">i", 0)                        # throttle_time_ms
+
+    body += struct.pack(">h", error_code)                   # error_code INT16
+
+    # member_assignment as BYTES: INT32 length + raw bytes
+    body += struct.pack(">i", len(member_assignment_bytes)) + member_assignment_bytes
 
     return build_frame(resp_header + body)
 
