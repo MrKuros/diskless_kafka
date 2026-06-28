@@ -226,11 +226,12 @@ SUPPORTED_APIS: list[tuple[int, int, int]] = [
     # kafka-python infers broker version from these ranges.
     # MetadataRequest[5] (key=3, v5) → detected as Kafka ≥1.0.0
     # → sends Produce v3+ (RecordBatch/magic=2) instead of old MessageSet.
-    (0,  0,  7),  # Produce        — Day 6  (v3+ = RecordBatch/magic=2)
-    (1,  0,  4),  # Fetch          — Day 7  (capped at v4: no session mgmt)
-    (2,  0,  2),  # ListOffsets    — Day 7  (v2 for ≥1.0.0 compat)
-    (3,  0,  5),  # Metadata       — Day 4  (v5 → ≥1.0.0 detection)
-    (18, 0,  0),  # ApiVersions    — Day 3
+    (0,  0,  7),  # Produce          — Day 6  (v3+ = RecordBatch/magic=2)
+    (1,  0,  4),  # Fetch            — Day 7  (capped at v4: no session mgmt)
+    (2,  0,  2),  # ListOffsets      — Day 7  (v2 for ≥1.0.0 compat)
+    (3,  0,  5),  # Metadata         — Day 4  (v5 → ≥1.0.0 detection)
+    (10, 0,  0),  # FindCoordinator  — Day 8  (v0 is all kafka-python needs)
+    (18, 0,  0),  # ApiVersions      — Day 3
 ]
 
 
@@ -856,6 +857,52 @@ def build_list_offsets_response(
             else:
                 body += struct.pack(">q", timestamp)
                 body += struct.pack(">q", offset)
+
+    return build_frame(resp_header + body)
+
+
+# ---------------------------------------------------------------------------
+# FindCoordinator response builder  (API key 10)
+# ---------------------------------------------------------------------------
+# Wire format:
+#   v0: error_code (INT16) | coordinator_id (INT32) | host (STRING) | port (INT32)
+#   v1: adds throttle_time_ms (INT32) at the front and error_message (STRING)
+#       after error_code
+#
+# Since we are a single-broker cluster we always point the client at ourselves.
+# error_code = 0 (NONE), coordinator_id = 1, host = "localhost", port = 9092.
+
+def build_find_coordinator_response(
+    correlation_id: int,
+    api_version: int = 0,
+    error_code: int = 0,
+    coordinator_id: int = 1,
+    host: str = "localhost",
+    port: int = 9092,
+) -> bytes:
+    """
+    Build a framed FindCoordinator (GroupCoordinator) response.
+
+    For our single-broker setup we always claim that *we* are the coordinator.
+    The response is identical for any consumer group name.
+    """
+    resp_header = struct.pack(">i", correlation_id)
+    host_b = host.encode("utf-8")
+
+    body = b""
+    if api_version >= 1:
+        # v1+ prepends throttle_time_ms
+        body += struct.pack(">i", 0)           # throttle_time_ms
+
+    body += struct.pack(">h", error_code)      # error_code INT16
+
+    if api_version >= 1:
+        # v1+ includes a human-readable error message (nullable STRING)
+        body += struct.pack(">h", -1)          # error_message = null
+
+    body += struct.pack(">i", coordinator_id)  # coordinator_id INT32
+    body += struct.pack(">h", len(host_b)) + host_b  # host STRING
+    body += struct.pack(">i", port)            # port INT32
 
     return build_frame(resp_header + body)
 

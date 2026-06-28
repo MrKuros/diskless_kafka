@@ -27,6 +27,7 @@ from protocol import (
     ParseError,
     RequestHeader,
     build_api_versions_response,
+    build_find_coordinator_response,
     build_metadata_response,
     build_produce_response,
     parse_metadata_request_topics,
@@ -118,6 +119,9 @@ def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
 
     if header.api_key == 2:   # ListOffsets
         return _handle_list_offsets(header, payload)
+
+    if header.api_key == 10:  # FindCoordinator
+        return _handle_find_coordinator(header, payload)
 
     return None
 
@@ -213,11 +217,60 @@ def _handle_list_offsets(header: RequestHeader, payload: bytes) -> bytes | None:
     return build_list_offsets_response(header.correlation_id, results, header.api_version)
 
 
+# ---------------------------------------------------------------------------
+# FindCoordinator handler  (API key 10)
+# ---------------------------------------------------------------------------
+
+def _handle_find_coordinator(header: RequestHeader, payload: bytes) -> bytes | None:
+    """
+    Handle a FindCoordinator (GroupCoordinator) request.
+
+    The client sends a group_id string and asks: "Which broker is the
+    coordinator for this consumer group?"
+
+    In a real multi-broker Kafka cluster the answer is determined by:
+        coordinator_id = hash(group_id) % num_partitions(__consumer_offsets)
+    then whoever leads that __consumer_offsets partition is the coordinator.
+
+    Since we are a single-broker cluster, the answer is always: us.
+    We return error_code=0, coordinator_id=1, host="localhost", port=9092.
+    """
+    body = payload[header.header_size:]
+    pos  = 0
+
+    def rd_str() -> str:
+        nonlocal pos
+        n = struct.unpack_from(">h", body, pos)[0]; pos += 2
+        if n < 0:
+            return ""
+        s = body[pos: pos + n].decode("utf-8"); pos += n
+        return s
+
+    # v0: coordinator_key = consumer_group  (STRING)
+    # v1: coordinator_key = STRING, coordinator_type = INT8  (0=group, 1=txn)
+    group_id = rd_str()
+
+    coordinator_type = 0  # default = consumer group
+    if header.api_version >= 1:
+        coordinator_type = struct.unpack_from(">b", body, pos)[0]
+
+    log.info(
+        "FindCoordinator ← group_id=%r type=%d → returning localhost:9092 (broker_id=1)",
+        group_id,
+        coordinator_type,
+    )
+
+    return build_find_coordinator_response(
+        correlation_id=header.correlation_id,
+        api_version=header.api_version,
+        error_code=0,
+        coordinator_id=1,
+        host="localhost",
+        port=9092,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Produce handler — store batch to MinIO and send ack response
-# ---------------------------------------------------------------------------
+
 
 def _handle_produce(header: RequestHeader, payload: bytes) -> bytes | None:
     """
