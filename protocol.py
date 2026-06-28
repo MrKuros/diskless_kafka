@@ -231,6 +231,7 @@ SUPPORTED_APIS: list[tuple[int, int, int]] = [
     (2,  0,  2),  # ListOffsets      — Day 7  (v2 for ≥1.0.0 compat)
     (3,  0,  5),  # Metadata         — Day 4  (v5 → ≥1.0.0 detection)
     (10, 0,  0),  # FindCoordinator  — Day 8  (v0 is all kafka-python needs)
+    (11, 0,  1),  # JoinGroup        — Day 9  (v1 adds rebalance_timeout)
     (18, 0,  0),  # ApiVersions      — Day 3
 ]
 
@@ -903,6 +904,70 @@ def build_find_coordinator_response(
     body += struct.pack(">i", coordinator_id)  # coordinator_id INT32
     body += struct.pack(">h", len(host_b)) + host_b  # host STRING
     body += struct.pack(">i", port)            # port INT32
+
+    return build_frame(resp_header + body)
+
+
+# ---------------------------------------------------------------------------
+# JoinGroup response builder  (API key 11)
+# ---------------------------------------------------------------------------
+# Wire format:
+#   v0/v1: error_code | generation_id | group_protocol | leader_id |
+#           member_id | members[]
+#   v2+:   throttle_time_ms | (same as v0)
+#
+# The members array is only populated for the group leader.
+# Non-leader members receive an empty array — they get their assignments
+# later via SyncGroup.
+#
+# members element:
+#   v0–v4: member_id (STRING) | member_metadata (BYTES)
+#   v5+:   member_id (STRING) | group_instance_id (nullable STRING)
+#           | member_metadata (BYTES)
+
+def build_join_group_response(
+    correlation_id: int,
+    api_version:    int,
+    error_code:     int,
+    generation_id:  int,
+    protocol_name:  str,
+    leader_id:      str,
+    member_id:      str,
+    members: list[tuple[str, bytes]],  # (member_id, metadata) — leader only
+) -> bytes:
+    """
+    Build a framed JoinGroup response.
+
+    *members* should be the full list of (member_id, metadata) when
+    responding to the leader, and an empty list for everyone else.
+    """
+    resp_header = struct.pack(">i", correlation_id)
+    body = b""
+
+    if api_version >= 2:
+        body += struct.pack(">i", 0)            # throttle_time_ms
+
+    body += struct.pack(">h", error_code)       # error_code INT16
+    body += struct.pack(">i", generation_id)    # generation_id INT32
+
+    proto_b = protocol_name.encode("utf-8")
+    body += struct.pack(">h", len(proto_b)) + proto_b  # group_protocol STRING
+
+    leader_b = leader_id.encode("utf-8")
+    body += struct.pack(">h", len(leader_b)) + leader_b  # leader_id STRING
+
+    member_b = member_id.encode("utf-8")
+    body += struct.pack(">h", len(member_b)) + member_b  # member_id STRING
+
+    # members array
+    body += struct.pack(">i", len(members))
+    for (mid, metadata) in members:
+        mid_b = mid.encode("utf-8")
+        body += struct.pack(">h", len(mid_b)) + mid_b   # member_id STRING
+        if api_version >= 5:
+            body += struct.pack(">h", -1)               # group_instance_id null
+        # metadata BYTES: INT32 length prefix + raw bytes
+        body += struct.pack(">i", len(metadata)) + metadata
 
     return build_frame(resp_header + body)
 

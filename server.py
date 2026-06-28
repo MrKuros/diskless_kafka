@@ -28,6 +28,7 @@ from protocol import (
     RequestHeader,
     build_api_versions_response,
     build_find_coordinator_response,
+    build_join_group_response,
     build_metadata_response,
     build_produce_response,
     parse_metadata_request_topics,
@@ -90,6 +91,29 @@ def _hex_dump(data: bytes, bytes_per_row: int = 16) -> str:
 # returns a ready-to-send response frame (including the 4-byte length prefix)
 # or None if we don't handle that API yet.
 
+# ---------------------------------------------------------------------------
+# In-memory group state
+# ---------------------------------------------------------------------------
+# Keyed by group_id.  Each entry:
+#   {
+#     "generation_id":  int,           current epoch (starts at 1)
+#     "leader_id":      str,           member_id of the elected leader
+#     "protocol":       str,           chosen protocol name (e.g. "range")
+#     "members": {
+#       member_id: {"metadata": bytes, "client_id": str}
+#     }
+#   }
+#
+# This is intentionally simple — no persistence, no locks (single-threaded
+# asyncio event loop), no expiry / heartbeat tracking yet.
+
+GROUP_STATE: dict[str, dict] = {}
+
+
+# ---------------------------------------------------------------------------
+# Dispatch table
+# ---------------------------------------------------------------------------
+
 def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
     """
     Route the request to the appropriate handler based on api_key.
@@ -122,6 +146,9 @@ def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
 
     if header.api_key == 10:  # FindCoordinator
         return _handle_find_coordinator(header, payload)
+
+    if header.api_key == 11:  # JoinGroup
+        return _handle_join_group(header, payload)
 
     return None
 
@@ -267,6 +294,129 @@ def _handle_find_coordinator(header: RequestHeader, payload: bytes) -> bytes | N
         coordinator_id=1,
         host="localhost",
         port=9092,
+    )
+
+
+# ---------------------------------------------------------------------------
+# JoinGroup handler  (API key 11)
+# ---------------------------------------------------------------------------
+
+def _handle_join_group(header: RequestHeader, payload: bytes) -> bytes | None:
+    """
+    Handle a JoinGroup request.
+
+    Protocol:
+    1. Parse the request (group_id, session_timeout, member_id, protocols).
+    2. If member_id == "" this is a fresh join — assign a new UUID-based ID.
+    3. Register the member in GROUP_STATE[group_id].
+    4. For a single-broker single-member setup, immediately elect this member
+       as the group leader and return generation_id=1 with the full member list.
+       (In a real broker we would wait for all members before responding.)
+    """
+    import uuid
+
+    body = payload[header.header_size:]
+    pos  = 0
+
+    def rd_str() -> str:
+        nonlocal pos
+        n = struct.unpack_from(">h", body, pos)[0]; pos += 2
+        if n < 0:
+            return ""
+        s = body[pos: pos + n].decode("utf-8"); pos += n
+        return s
+
+    def rd_i32() -> int:
+        nonlocal pos
+        v = struct.unpack_from(">i", body, pos)[0]; pos += 4; return v
+
+    def rd_bytes() -> bytes:
+        nonlocal pos
+        n = struct.unpack_from(">i", body, pos)[0]; pos += 4
+        if n < 0:
+            return b""
+        b_ = body[pos: pos + n]; pos += n
+        return bytes(b_)
+
+    # ── Parse request body ────────────────────────────────────────────────
+    group_id        = rd_str()
+    session_timeout = rd_i32()
+    if header.api_version >= 1:
+        _rebalance_timeout = rd_i32()
+    member_id       = rd_str()
+    if header.api_version >= 5:
+        _group_instance_id = rd_str()   # nullable, ignore for now
+    protocol_type   = rd_str()          # always "consumer"
+
+    protocol_count  = rd_i32()
+    protocols: list[tuple[str, bytes]] = []
+    for _ in range(protocol_count):
+        proto_name = rd_str()
+        proto_meta = rd_bytes()
+        protocols.append((proto_name, proto_meta))
+
+    # ── Assign member_id if this is a fresh join ──────────────────────────
+    if not member_id:
+        member_id = f"{header.client_id}-{uuid.uuid4()}"
+        log.info("JoinGroup: assigned new member_id=%r to client %r",
+                 member_id, header.client_id)
+
+    # ── Choose protocol (pick the first one the client advertises) ────────
+    chosen_protocol = protocols[0][0] if protocols else "range"
+    chosen_metadata = protocols[0][1] if protocols else b""
+
+    # ── Update in-memory group state ──────────────────────────────────────
+    if group_id not in GROUP_STATE:
+        GROUP_STATE[group_id] = {
+            "generation_id": 1,
+            "leader_id":     member_id,
+            "protocol":      chosen_protocol,
+            "members":       {},
+        }
+        log.info("JoinGroup: created new group %r  generation=1  leader=%r",
+                 group_id, member_id)
+    else:
+        # Existing group — increment generation (rebalance)
+        GROUP_STATE[group_id]["generation_id"] += 1
+        log.info("JoinGroup: group %r rebalancing  generation=%d",
+                 group_id, GROUP_STATE[group_id]["generation_id"])
+
+    grp = GROUP_STATE[group_id]
+    grp["members"][member_id] = {
+        "metadata":  chosen_metadata,
+        "client_id": header.client_id,
+    }
+
+    leader_id     = grp["leader_id"]
+    generation_id = grp["generation_id"]
+    protocol_name = grp["protocol"]
+
+    # Only the leader receives the full member list (Kafka spec requirement).
+    # Followers receive an empty array and must wait for SyncGroup.
+    if member_id == leader_id:
+        member_list = [
+            (mid, info["metadata"])
+            for mid, info in grp["members"].items()
+        ]
+    else:
+        member_list = []
+
+    log.info(
+        "JoinGroup ← group=%r generation=%d protocol=%r "
+        "leader=%r member=%r (is_leader=%s)",
+        group_id, generation_id, protocol_name,
+        leader_id, member_id, member_id == leader_id,
+    )
+
+    return build_join_group_response(
+        correlation_id=header.correlation_id,
+        api_version=header.api_version,
+        error_code=0,
+        generation_id=generation_id,
+        protocol_name=protocol_name,
+        leader_id=leader_id,
+        member_id=member_id,
+        members=member_list,
     )
 
 
