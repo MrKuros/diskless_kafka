@@ -28,6 +28,7 @@ Configuration (change these to match your MinIO instance):
 from __future__ import annotations
 
 import io
+import json
 import struct
 import logging
 from minio import Minio
@@ -280,3 +281,93 @@ def read_batch(
     )
 
     return batch_bytes, hw
+
+
+# ---------------------------------------------------------------------------
+# Committed offset persistence  (mirrors __consumer_offsets in real Kafka)
+# ---------------------------------------------------------------------------
+# In real Kafka, committed offsets are stored in a compacted internal topic
+# called __consumer_offsets.  Compaction keeps only the latest entry per
+# (group, topic, partition) key — effectively the same as overwriting an
+# S3 object with the same key on every commit.
+#
+# We use the key format:
+#   __consumer_offsets/{group_id}/{topic}/{partition}.json
+#
+# Each object contains a tiny JSON payload:
+#   {"group": "...", "topic": "...", "partition": 0, "offset": 42}
+#
+# This is human-readable, easily inspectable via the MinIO console, and
+# gives us crash-safe persistence at the cost of one HTTP PUT per commit.
+
+
+def commit_offset(group_id: str, topic: str, partition: int, offset: int) -> None:
+    """
+    Persist a committed offset to MinIO.
+
+    The object is overwritten on every call — S3 PUT idempotency acts as
+    the compaction mechanism: only the most recent value survives.
+
+    Object key: __consumer_offsets/{group_id}/{topic}/{partition}.json
+    """
+    object_key = f"__consumer_offsets/{group_id}/{topic}/{partition}.json"
+    payload = json.dumps({
+        "group":     group_id,
+        "topic":     topic,
+        "partition": partition,
+        "offset":    offset,
+    }).encode("utf-8")
+
+    client = get_client()
+    client.put_object(
+        MINIO_BUCKET,
+        object_key,
+        io.BytesIO(payload),
+        length=len(payload),
+        content_type="application/json",
+    )
+    log.debug(
+        "MinIO PUT  s3://%s/%s  offset=%d",
+        MINIO_BUCKET, object_key, offset,
+    )
+
+
+def load_committed_offsets() -> dict[tuple[str, str, int], int]:
+    """
+    Load all persisted committed offsets from MinIO on broker startup.
+
+    Scans the __consumer_offsets/ prefix, reads every JSON object, and
+    returns a dict keyed by (group_id, topic, partition) → offset.
+
+    Called once at startup to pre-populate server.COMMITTED_OFFSETS so
+    consumers can resume from where they left off after a broker restart.
+    """
+    client = get_client()
+    prefix = "__consumer_offsets/"
+    result: dict[tuple[str, str, int], int] = {}
+
+    try:
+        objects = list(client.list_objects(MINIO_BUCKET, prefix=prefix, recursive=True))
+    except S3Error as exc:
+        log.warning("MinIO: could not list committed offsets: %s", exc)
+        return result
+
+    for obj in objects:
+        if not obj.object_name.endswith(".json"):
+            continue
+        try:
+            resp = client.get_object(MINIO_BUCKET, obj.object_name)
+            data = json.loads(resp.read().decode("utf-8"))
+            resp.close()
+            key = (data["group"], data["topic"], data["partition"])
+            result[key] = data["offset"]
+            log.info(
+                "MinIO: loaded committed offset  group=%r topic=%r "
+                "partition=%d offset=%d",
+                data["group"], data["topic"], data["partition"], data["offset"],
+            )
+        except Exception as exc:
+            log.warning("MinIO: failed to read %r: %s", obj.object_name, exc)
+
+    log.info("MinIO: loaded %d committed offset(s) from persistent storage", len(result))
+    return result

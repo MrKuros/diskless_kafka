@@ -25,11 +25,12 @@ import sys
 
 from protocol import (
     ParseError,
-    RequestHeader,
+    SUPPORTED_APIS,
     build_api_versions_response,
     build_find_coordinator_response,
     build_heartbeat_response,
     build_join_group_response,
+    build_leave_group_response,
     build_metadata_response,
     build_offset_commit_response,
     build_offset_fetch_response,
@@ -42,7 +43,7 @@ from protocol import (
     parse_records_in_batch,
     parse_request_header,
 )
-from storage import write_batch
+from storage import commit_offset, load_committed_offsets, write_batch
 
 HOST = "0.0.0.0"
 PORT = 9092
@@ -118,7 +119,8 @@ GROUP_STATE: dict[str, dict] = {}
 # Value is the committed offset integer.
 # -1 sentinel is used in OffsetFetch responses to mean "no offset stored yet".
 #
-# This is memory-only for now.  Persistence (to MinIO) will be added later.
+# Pre-populated from MinIO at startup via load_committed_offsets().
+# Updated in memory on every OffsetCommit, then persisted to MinIO.
 COMMITTED_OFFSETS: dict[tuple[str, str, int], int] = {}
 
 
@@ -170,6 +172,9 @@ def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
 
     if header.api_key == 12:  # Heartbeat
         return _handle_heartbeat(header, payload)
+
+    if header.api_key == 13:  # LeaveGroup
+        return _handle_leave_group(header, payload)
 
     if header.api_key == 14:  # SyncGroup
         return _handle_sync_group(header, payload)
@@ -511,6 +516,16 @@ def _handle_offset_commit(header: RequestHeader, payload: bytes) -> bytes | None
                 "OffsetCommit ← group=%r topic=%r partition=%d offset=%d",
                 group_id, topic, partition, offset,
             )
+            # Persist to MinIO so offsets survive broker restarts.
+            # This is a synchronous HTTP PUT — acceptable for now since
+            # OffsetCommit is infrequent (every auto.commit.interval.ms = 5s).
+            try:
+                commit_offset(group_id, topic, partition, offset)
+            except Exception as exc:
+                log.warning(
+                    "OffsetCommit: MinIO persist failed for %r/%r/%d: %s",
+                    group_id, topic, partition, exc,
+                )
 
         results.append((topic, committed_partitions))
 
@@ -658,7 +673,7 @@ def _handle_heartbeat(header: RequestHeader, payload: bytes) -> bytes | None:
 
     # ── Healthy heartbeat ──────────────────────────────────────────────────
     log.debug(
-        "Heartbeat ← group=%r generation=%d member=%r OK",
+        "Heartbeat ← group=%r generation=%d member=%r → OK",
         group_id, generation_id, member_id,
     )
     return build_heartbeat_response(
@@ -666,6 +681,12 @@ def _handle_heartbeat(header: RequestHeader, payload: bytes) -> bytes | None:
         api_version=header.api_version,
         error_code=0,
     )
+
+
+def _handle_leave_group(header: RequestHeader, payload: bytes) -> bytes:
+    """LeaveGroup (API 13) -> Returns success to unblock consumer.close()"""
+    log.info("LeaveGroup ← received")
+    return build_leave_group_response(header.correlation_id, header.api_version)
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +1002,15 @@ async def handle_connection(
 # Entry point
 # ---------------------------------------------------------------------------
 async def main() -> None:
+    # ── Load persisted committed offsets from MinIO before accepting connections
+    global COMMITTED_OFFSETS
+    log.info("Loading committed offsets from MinIO …")
+    try:
+        COMMITTED_OFFSETS = load_committed_offsets()
+    except Exception as exc:
+        log.warning("Could not load committed offsets from MinIO: %s", exc)
+        COMMITTED_OFFSETS = {}
+
     server = await asyncio.start_server(
         handle_connection,
         HOST,
