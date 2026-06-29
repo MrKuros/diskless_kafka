@@ -25,6 +25,7 @@ import sys
 
 from protocol import (
     ParseError,
+    RequestHeader,
     SUPPORTED_APIS,
     build_api_versions_response,
     build_find_coordinator_response,
@@ -123,12 +124,30 @@ GROUP_STATE: dict[str, dict] = {}
 # Updated in memory on every OffsetCommit, then persisted to MinIO.
 COMMITTED_OFFSETS: dict[tuple[str, str, int], int] = {}
 
+# ---------------------------------------------------------------------------
+# Fetch long-poll: per-partition wakeup events (our simplified "purgatory")
+# ---------------------------------------------------------------------------
+# When a Fetch request arrives and fetch_offset >= hw (no new data), we park
+# the coroutine here instead of returning an empty response immediately.
+#
+# Key:   (topic, partition)
+# Value: asyncio.Event  — set() when a Produce writes to that partition,
+#                          cleared() after each wait cycle.
+#
+# This is a simplified version of Kafka's DelayedOperation Purgatory:
+#   • Real Kafka: TimingWheel + tryComplete on every Produce (O(1))
+#   • Our version: asyncio.Event per partition, Produce calls set()
+#
+# Without this, the consumer would always wait the full max_wait_ms even
+# if new data arrived 1ms after the Fetch. With it, the consumer wakes
+# up within ~1ms of a matching Produce.
+FETCH_WAITERS: dict[tuple[str, int], asyncio.Event] = {}
 
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
 
-def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
+async def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
     """
     Route the request to the appropriate handler based on api_key.
 
@@ -153,7 +172,7 @@ def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
         return _handle_produce(header, payload)
 
     if header.api_key == 1:   # Fetch
-        return _handle_fetch(header, payload)
+        return await _handle_fetch(header, payload)
 
     if header.api_key == 2:   # ListOffsets
         return _handle_list_offsets(header, payload)
@@ -185,12 +204,18 @@ def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
 # Fetch handler — read batch from MinIO and send response
 # ---------------------------------------------------------------------------
 
-def _handle_fetch(header: RequestHeader, payload: bytes) -> bytes | None:
+async def _handle_fetch(header: RequestHeader, payload: bytes) -> bytes | None:
     """
-    Handle a Fetch request:
-      1. Parse request body to get list of (topic, partition, fetch_offset).
-      2. Call read_batch() for each partition to get bytes + high_watermark.
-      3. Build and return the Fetch response.
+    Handle a Fetch request with long-polling.
+
+    If fetch_offset >= high_watermark (no new data), we hold the response
+    for up to max_wait_ms milliseconds before returning empty.  Two things
+    can end the wait early:
+      a) A Produce request writes to a watched partition  →  FETCH_WAITERS
+         event is set(), we wake up and re-check hw.
+      b) max_wait_ms expires  →  we return empty unconditionally.
+
+    This mirrors Kafka's DelayedFetch purgatory at a small scale.
     """
     from protocol import parse_fetch_request, build_fetch_response
     from storage import read_batch
@@ -201,26 +226,75 @@ def _handle_fetch(header: RequestHeader, payload: bytes) -> bytes | None:
         log.warning("Fetch — parse error: %s", exc)
         return None
 
-    results = []
-    for f in fetches:
-        topic = f["topic"]
-        partition = f["partition"]
-        fetch_offset = f["fetch_offset"]
+    # max_wait_ms is the same for all partitions in this request
+    max_wait_ms = fetches[0]["max_wait_ms"] if fetches else 500
+    deadline    = asyncio.get_event_loop().time() + max_wait_ms / 1000.0
 
-        try:
-            batch_bytes, hw = read_batch(topic, partition, fetch_offset)
-            error_code = 0  # NONE
-        except Exception as exc:
-            log.error("Fetch → failed to read %s/%d: %s", topic, partition, exc)
-            batch_bytes = None
-            hw = 0
-            error_code = 5  # LEADER_NOT_AVAILABLE
+    # ── Long-poll loop ────────────────────────────────────────────────────
+    # We wait until at least one partition has data OR the deadline expires.
+    # Poll interval: 50 ms — fine-grained enough, coarse enough to avoid spin.
+    POLL_INTERVAL = 0.050   # 50 ms
 
+    while True:
+        results = []
+        any_data = False
+
+        for f in fetches:
+            topic        = f["topic"]
+            partition    = f["partition"]
+            fetch_offset = f["fetch_offset"]
+
+            try:
+                batch_bytes, hw = read_batch(topic, partition, fetch_offset)
+                error_code = 0
+            except Exception as exc:
+                log.error("Fetch → failed to read %s/%d: %s", topic, partition, exc)
+                batch_bytes = None
+                hw          = 0
+                error_code  = 5   # LEADER_NOT_AVAILABLE
+
+            if batch_bytes:
+                any_data = True
+            results.append((topic, partition, error_code, hw, batch_bytes))
+
+        if any_data:
+            # We have real data — send it immediately.
+            break
+
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            # max_wait_ms elapsed — send empty response.
+            log.debug(
+                "Fetch long-poll expired after %d ms — returning empty",
+                max_wait_ms,
+            )
+            break
+
+        # No data yet — park until a Produce wakes us or the interval elapses.
+        # We watch the event for the first requested partition (simplification:
+        # a multi-partition Fetch wakes on any produce to partition 0 of the
+        # first topic; good enough for our single-partition topology).
+        if fetches:
+            watch_key = (fetches[0]["topic"], fetches[0]["partition"])
+            event = FETCH_WAITERS.setdefault(watch_key, asyncio.Event())
+            sleep_time = min(POLL_INTERVAL, remaining)
+            try:
+                await asyncio.wait_for(event.wait(), timeout=sleep_time)
+                event.clear()   # reset so next wait works
+                log.debug("Fetch long-poll woken by Produce on %s/%d",
+                          watch_key[0], watch_key[1])
+            except asyncio.TimeoutError:
+                pass  # interval elapsed; loop and re-check hw
+        else:
+            break
+
+    # ── Log and respond ───────────────────────────────────────────────────
+    for (topic, partition, error_code, hw, batch_bytes) in results:
         log.info(
             "Fetch ←  topic=%r  partition=%d  fetch_offset=%d  hw=%d  bytes=%d",
-            topic, partition, fetch_offset, hw, len(batch_bytes) if batch_bytes else 0
+            topic, partition, fetch_offset, hw,
+            len(batch_bytes) if batch_bytes else 0,
         )
-        results.append((topic, partition, error_code, hw, batch_bytes))
 
     return build_fetch_response(header.correlation_id, results, header.api_version)
 
@@ -888,6 +962,12 @@ def _handle_produce(header: RequestHeader, payload: bytes) -> bytes | None:
                     "Produce →  ack  topic=%r  partition=%d  base_offset=%d",
                     p["topic"], p["partition"], base_offset,
                 )
+                # ── Wake any Fetch coroutines long-polling this partition ────
+                # This is the produce-side of our purgatory: instead of making
+                # the consumer wait up to max_wait_ms, we signal immediately.
+                waiter_key = (p["topic"], p["partition"])
+                if waiter_key in FETCH_WAITERS:
+                    FETCH_WAITERS[waiter_key].set()
             except Exception as exc:
                 log.error(
                     "Produce →  MinIO write failed for topic=%r partition=%d: %s",
@@ -965,7 +1045,7 @@ async def handle_connection(
                 continue
 
             # ── Step 5: dispatch and send response ───────────────────────────
-            response = dispatch(header, payload)
+            response = await dispatch(header, payload)
 
             if response is not None:
                 writer.write(response)

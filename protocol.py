@@ -1435,19 +1435,13 @@ def parse_records_in_batch(record_set: bytes) -> list[dict]:
 def build_leave_group_response(correlation_id: int, version: int = 1) -> bytes:
     """
     LeaveGroup Response (API 13).
-    v0: error_code (Int16)
-    v1: throttle_time_ms (Int32), error_code (Int16)
+    v0: error_code (Int16)                  → 2 bytes payload
+    v1: throttle_time_ms (Int32) + error_code (Int16) → 6 bytes payload
     """
     if version == 0:
-        payload_size = 2
-        fmt = ">i h"
-        args = (correlation_id, 0)
+        payload = struct.pack(">h", 0)              # error_code = NONE
     else:
-        payload_size = 6
-        fmt = ">i ih"
-        args = (correlation_id, 0, 0)
-        
-    frame = bytearray(LENGTH_PREFIX_BYTES + 4 + payload_size)
-    struct.pack_into(">i", frame, 0, 4 + payload_size)
-    struct.pack_into(fmt, frame, 4, *args)
-    return bytes(frame)
+        payload = struct.pack(">ih", 0, 0)          # throttle_time_ms=0, error_code=NONE
+
+    resp_header = struct.pack(">i", correlation_id)
+    return build_frame(resp_header + payload)
