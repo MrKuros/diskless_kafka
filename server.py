@@ -28,6 +28,7 @@ from protocol import (
     RequestHeader,
     build_api_versions_response,
     build_find_coordinator_response,
+    build_heartbeat_response,
     build_join_group_response,
     build_metadata_response,
     build_produce_response,
@@ -151,6 +152,9 @@ def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
 
     if header.api_key == 11:  # JoinGroup
         return _handle_join_group(header, payload)
+
+    if header.api_key == 12:  # Heartbeat
+        return _handle_heartbeat(header, payload)
 
     if header.api_key == 14:  # SyncGroup
         return _handle_sync_group(header, payload)
@@ -422,6 +426,95 @@ def _handle_join_group(header: RequestHeader, payload: bytes) -> bytes | None:
         leader_id=leader_id,
         member_id=member_id,
         members=member_list,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat handler  (API key 12)
+# ---------------------------------------------------------------------------
+
+def _handle_heartbeat(header: RequestHeader, payload: bytes) -> bytes | None:
+    """
+    Handle a Heartbeat request.
+
+    kafka-python sends heartbeats from a background thread every
+    heartbeat.interval.ms (default 3s). We must reply quickly so the
+    client doesn't declare the coordinator dead and trigger a rebalance.
+
+    Validation:
+      - group_id must exist in GROUP_STATE
+      - member_id must be a known member of that group
+      - generation_id must match the current stored generation
+        (mismatch = ILLEGAL_GENERATION, consumer must rejoin)
+    """
+    body = payload[header.header_size:]
+    pos  = 0
+
+    def rd_str() -> str:
+        nonlocal pos
+        n = struct.unpack_from(">h", body, pos)[0]; pos += 2
+        if n < 0:
+            return ""
+        s = body[pos: pos + n].decode("utf-8"); pos += n
+        return s
+
+    def rd_i32() -> int:
+        nonlocal pos
+        v = struct.unpack_from(">i", body, pos)[0]; pos += 4; return v
+
+    group_id      = rd_str()
+    generation_id = rd_i32()
+    member_id     = rd_str()
+    # v2+ has group_instance_id — we don't need to parse it for validation
+
+    grp = GROUP_STATE.get(group_id)
+
+    # ── Unknown group ──────────────────────────────────────────────────────
+    if grp is None:
+        log.warning(
+            "Heartbeat: unknown group %r from member %r — UNKNOWN_MEMBER_ID",
+            group_id, member_id,
+        )
+        return build_heartbeat_response(
+            correlation_id=header.correlation_id,
+            api_version=header.api_version,
+            error_code=25,  # UNKNOWN_MEMBER_ID
+        )
+
+    # ── Unknown member ─────────────────────────────────────────────────────
+    if member_id not in grp["members"]:
+        log.warning(
+            "Heartbeat: unknown member %r in group %r — UNKNOWN_MEMBER_ID",
+            member_id, group_id,
+        )
+        return build_heartbeat_response(
+            correlation_id=header.correlation_id,
+            api_version=header.api_version,
+            error_code=25,  # UNKNOWN_MEMBER_ID
+        )
+
+    # ── Stale generation ───────────────────────────────────────────────────
+    if generation_id != grp["generation_id"]:
+        log.warning(
+            "Heartbeat: stale generation_id=%d (current=%d) "
+            "from member %r in group %r — ILLEGAL_GENERATION",
+            generation_id, grp["generation_id"], member_id, group_id,
+        )
+        return build_heartbeat_response(
+            correlation_id=header.correlation_id,
+            api_version=header.api_version,
+            error_code=22,  # ILLEGAL_GENERATION
+        )
+
+    # ── Healthy heartbeat ──────────────────────────────────────────────────
+    log.debug(
+        "Heartbeat ← group=%r generation=%d member=%r OK",
+        group_id, generation_id, member_id,
+    )
+    return build_heartbeat_response(
+        correlation_id=header.correlation_id,
+        api_version=header.api_version,
+        error_code=0,
     )
 
 

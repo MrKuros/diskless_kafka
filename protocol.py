@@ -232,6 +232,7 @@ SUPPORTED_APIS: list[tuple[int, int, int]] = [
     (3,  0,  5),  # Metadata         — Day 4  (v5 → ≥1.0.0 detection)
     (10, 0,  0),  # FindCoordinator  — Day 8  (v0 is all kafka-python needs)
     (11, 0,  1),  # JoinGroup        — Day 9  (v1 adds rebalance_timeout)
+    (12, 0,  1),  # Heartbeat        — Day 11 (v1 adds throttle_time_ms)
     (14, 0,  1),  # SyncGroup        — Day 10 (v1 adds throttle_time_ms)
     (18, 0,  0),  # ApiVersions      — Day 3
 ]
@@ -1032,6 +1033,37 @@ def build_sync_group_response(
     # member_assignment as BYTES: INT32 length + raw bytes
     body += struct.pack(">i", len(member_assignment_bytes)) + member_assignment_bytes
 
+    return build_frame(resp_header + body)
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat response builder  (API key 12)
+# ---------------------------------------------------------------------------
+# Wire format:
+#   v0:  error_code (INT16)
+#   v1+: throttle_time_ms (INT32) | error_code (INT16)
+#
+# Request fields (all versions up to v1):
+#   group (STRING) | generation_id (INT32) | member_id (STRING)
+# v2+ adds: group_instance_id (nullable STRING)
+#
+# Error codes we use:
+#   0  — NONE            (heartbeat accepted, member is healthy)
+#   22 — ILLEGAL_GENERATION (stale generation_id; consumer must rejoin)
+#   25 — UNKNOWN_MEMBER_ID  (member_id not recognised; consumer must rejoin)
+#   27 — REBALANCE_IN_PROGRESS (group is currently rebalancing)
+
+def build_heartbeat_response(
+    correlation_id: int,
+    api_version:    int,
+    error_code:     int = 0,
+) -> bytes:
+    """Build a framed Heartbeat response."""
+    resp_header = struct.pack(">i", correlation_id)
+    body = b""
+    if api_version >= 1:
+        body += struct.pack(">i", 0)        # throttle_time_ms
+    body += struct.pack(">h", error_code)   # error_code INT16
     return build_frame(resp_header + body)
 
 
