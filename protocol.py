@@ -230,6 +230,8 @@ SUPPORTED_APIS: list[tuple[int, int, int]] = [
     (1,  0,  4),  # Fetch            — Day 7  (capped at v4: no session mgmt)
     (2,  0,  2),  # ListOffsets      — Day 7  (v2 for ≥1.0.0 compat)
     (3,  0,  5),  # Metadata         — Day 4  (v5 → ≥1.0.0 detection)
+    (8,  0,  2),  # OffsetCommit     — Day 12 (v2 = generation_id + retention)
+    (9,  0,  1),  # OffsetFetch      — Day 12 (v1 = kafka-backed storage)
     (10, 0,  0),  # FindCoordinator  — Day 8  (v0 is all kafka-python needs)
     (11, 0,  1),  # JoinGroup        — Day 9  (v1 adds rebalance_timeout)
     (12, 0,  1),  # Heartbeat        — Day 11 (v1 adds throttle_time_ms)
@@ -1064,6 +1066,92 @@ def build_heartbeat_response(
     if api_version >= 1:
         body += struct.pack(">i", 0)        # throttle_time_ms
     body += struct.pack(">h", error_code)   # error_code INT16
+    return build_frame(resp_header + body)
+
+
+# ---------------------------------------------------------------------------
+# OffsetCommit response builder  (API key 8)
+# ---------------------------------------------------------------------------
+# Response structure (v0–v2, same layout; v3+ adds throttle_time_ms at front):
+#
+#   [v3+ only]  throttle_time_ms  INT32
+#   topics      ARRAY
+#     topic     STRING
+#     partitions ARRAY
+#       partition   INT32
+#       error_code  INT16
+#
+# The request tells us which (topic, partition) pairs were committed, so we
+# echo each one back with error_code=0.  The caller passes the same topic/
+# partition structure it parsed from the request.
+
+def build_offset_commit_response(
+    correlation_id: int,
+    api_version:    int,
+    results: list[tuple[str, list[int]]],  # [(topic, [partition, ...])…]
+) -> bytes:
+    """Build a framed OffsetCommit response (error_code=0 for every partition)."""
+    resp_header = struct.pack(">i", correlation_id)
+    body = b""
+
+    if api_version >= 3:
+        body += struct.pack(">i", 0)              # throttle_time_ms
+
+    body += struct.pack(">i", len(results))       # topics array count
+    for topic, partitions in results:
+        topic_b = topic.encode("utf-8")
+        body += struct.pack(">h", len(topic_b)) + topic_b   # topic STRING
+        body += struct.pack(">i", len(partitions))           # partitions count
+        for p in partitions:
+            body += struct.pack(">i", p)          # partition INT32
+            body += struct.pack(">h", 0)          # error_code INT16 = NONE
+
+    return build_frame(resp_header + body)
+
+
+# ---------------------------------------------------------------------------
+# OffsetFetch response builder  (API key 9)
+# ---------------------------------------------------------------------------
+# Response structure (v0–v1):
+#
+#   topics    ARRAY
+#     topic   STRING
+#     partitions ARRAY
+#       partition   INT32
+#       offset      INT64    — -1 = no committed offset (start from beginning)
+#       metadata    STRING   — nullable, use null (-1 length)
+#       error_code  INT16
+#
+# v2+ adds a top-level error_code; v3+ prepends throttle_time_ms.
+
+def build_offset_fetch_response(
+    correlation_id: int,
+    api_version:    int,
+    results: list[tuple[str, list[tuple[int, int]]]],
+    # [(topic, [(partition, committed_offset)…])…]
+    # committed_offset = -1 means no commit stored yet (fetch from beginning)
+) -> bytes:
+    """Build a framed OffsetFetch response."""
+    resp_header = struct.pack(">i", correlation_id)
+    body = b""
+
+    if api_version >= 3:
+        body += struct.pack(">i", 0)              # throttle_time_ms
+
+    body += struct.pack(">i", len(results))       # topics array count
+    for topic, part_offsets in results:
+        topic_b = topic.encode("utf-8")
+        body += struct.pack(">h", len(topic_b)) + topic_b   # topic STRING
+        body += struct.pack(">i", len(part_offsets))        # partitions count
+        for partition, offset in part_offsets:
+            body += struct.pack(">i", partition)  # partition INT32
+            body += struct.pack(">q", offset)     # offset INT64 (-1 = none)
+            body += struct.pack(">h", -1)         # metadata STRING = null
+            body += struct.pack(">h", 0)          # error_code INT16 = NONE
+
+    if api_version >= 2:
+        body += struct.pack(">h", 0)              # top-level error_code
+
     return build_frame(resp_header + body)
 
 

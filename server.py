@@ -31,6 +31,8 @@ from protocol import (
     build_heartbeat_response,
     build_join_group_response,
     build_metadata_response,
+    build_offset_commit_response,
+    build_offset_fetch_response,
     build_produce_response,
     build_sync_group_response,
     encode_member_assignment,
@@ -112,6 +114,13 @@ def _hex_dump(data: bytes, bytes_per_row: int = 16) -> str:
 
 GROUP_STATE: dict[str, dict] = {}
 
+# Committed offsets store — keyed by (group_id, topic, partition).
+# Value is the committed offset integer.
+# -1 sentinel is used in OffsetFetch responses to mean "no offset stored yet".
+#
+# This is memory-only for now.  Persistence (to MinIO) will be added later.
+COMMITTED_OFFSETS: dict[tuple[str, str, int], int] = {}
+
 
 # ---------------------------------------------------------------------------
 # Dispatch table
@@ -146,6 +155,12 @@ def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
 
     if header.api_key == 2:   # ListOffsets
         return _handle_list_offsets(header, payload)
+
+    if header.api_key == 8:   # OffsetCommit
+        return _handle_offset_commit(header, payload)
+
+    if header.api_key == 9:   # OffsetFetch
+        return _handle_offset_fetch(header, payload)
 
     if header.api_key == 10:  # FindCoordinator
         return _handle_find_coordinator(header, payload)
@@ -426,6 +441,141 @@ def _handle_join_group(header: RequestHeader, payload: bytes) -> bytes | None:
         leader_id=leader_id,
         member_id=member_id,
         members=member_list,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OffsetCommit handler  (API key 8)
+# ---------------------------------------------------------------------------
+
+def _handle_offset_commit(header: RequestHeader, payload: bytes) -> bytes | None:
+    """
+    Handle an OffsetCommit request.
+
+    Parses the topic/partition/offset list and stores each committed offset
+    in COMMITTED_OFFSETS[(group_id, topic, partition)].
+    Returns error_code=0 for every partition.
+
+    Request versions:
+      v0: group_id | topics[topic | partitions[partition, offset, metadata]]
+      v1: adds generation_id + consumer_id; partitions also have timestamp
+      v2: replaces timestamp with retention_time (after group_id fields)
+      v3: same as v2 + throttle_time_ms in response
+    """
+    body = payload[header.header_size:]
+    pos  = 0
+
+    def rd_str() -> str:
+        nonlocal pos
+        n = struct.unpack_from(">h", body, pos)[0]; pos += 2
+        if n < 0:
+            return ""
+        s = body[pos: pos + n].decode("utf-8"); pos += n
+        return s
+
+    def rd_i32() -> int:
+        nonlocal pos
+        v = struct.unpack_from(">i", body, pos)[0]; pos += 4; return v
+
+    def rd_i64() -> int:
+        nonlocal pos
+        v = struct.unpack_from(">q", body, pos)[0]; pos += 8; return v
+
+    group_id = rd_str()
+
+    if header.api_version >= 1:
+        _generation_id = rd_i32()
+        _consumer_id   = rd_str()
+    if header.api_version >= 2:
+        _retention_time = rd_i64()   # -1 means use broker default
+
+    topic_count = rd_i32()
+    results: list[tuple[str, list[int]]] = []
+
+    for _ in range(topic_count):
+        topic = rd_str()
+        partition_count = rd_i32()
+        committed_partitions: list[int] = []
+
+        for _ in range(partition_count):
+            partition = rd_i32()
+            offset    = rd_i64()
+            if header.api_version == 1:
+                _timestamp = rd_i64()   # v1 only
+            _metadata = rd_str()        # all versions
+
+            key = (group_id, topic, partition)
+            COMMITTED_OFFSETS[key] = offset
+            committed_partitions.append(partition)
+            log.info(
+                "OffsetCommit ← group=%r topic=%r partition=%d offset=%d",
+                group_id, topic, partition, offset,
+            )
+
+        results.append((topic, committed_partitions))
+
+    return build_offset_commit_response(
+        correlation_id=header.correlation_id,
+        api_version=header.api_version,
+        results=results,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OffsetFetch handler  (API key 9)
+# ---------------------------------------------------------------------------
+
+def _handle_offset_fetch(header: RequestHeader, payload: bytes) -> bytes | None:
+    """
+    Handle an OffsetFetch request.
+
+    The consumer sends the list of (topic, partition) pairs it wants to know
+    the last committed offset for.  We look each up in COMMITTED_OFFSETS.
+    If nothing is stored yet, we return -1, which tells the consumer to start
+    from the beginning (auto_offset_reset='earliest') or the end ('latest').
+
+    Request schema is the same for v0–v3:
+      consumer_group STRING | topics ARRAY(topic STRING, partitions ARRAY INT32)
+    """
+    body = payload[header.header_size:]
+    pos  = 0
+
+    def rd_str() -> str:
+        nonlocal pos
+        n = struct.unpack_from(">h", body, pos)[0]; pos += 2
+        if n < 0:
+            return ""
+        s = body[pos: pos + n].decode("utf-8"); pos += n
+        return s
+
+    def rd_i32() -> int:
+        nonlocal pos
+        v = struct.unpack_from(">i", body, pos)[0]; pos += 4; return v
+
+    group_id    = rd_str()
+    topic_count = rd_i32()
+    results: list[tuple[str, list[tuple[int, int]]]] = []
+
+    for _ in range(topic_count):
+        topic      = rd_str()
+        part_count = rd_i32()
+        part_offsets: list[tuple[int, int]] = []
+
+        for _ in range(part_count):
+            partition = rd_i32()
+            committed = COMMITTED_OFFSETS.get((group_id, topic, partition), -1)
+            part_offsets.append((partition, committed))
+            log.info(
+                "OffsetFetch ← group=%r topic=%r partition=%d → committed=%d",
+                group_id, topic, partition, committed,
+            )
+
+        results.append((topic, part_offsets))
+
+    return build_offset_fetch_response(
+        correlation_id=header.correlation_id,
+        api_version=header.api_version,
+        results=results,
     )
 
 
