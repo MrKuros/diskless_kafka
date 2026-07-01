@@ -371,3 +371,115 @@ def load_committed_offsets() -> dict[tuple[str, str, int], int]:
 
     log.info("MinIO: loaded %d committed offset(s) from persistent storage", len(result))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Topic config persistence  (mirrors ZooKeeper/KRaft topic metadata)
+# ---------------------------------------------------------------------------
+# In real Kafka, topic metadata (partition count, replication factor, leader
+# assignments, ISR lists) is stored in ZooKeeper or the KRaft metadata log.
+# Every broker has a full in-memory copy refreshed via watches/replication.
+#
+# We store a single JSON object in MinIO:
+#   __topic_config/topics.json
+#
+# Schema:
+#   {
+#     "my-topic": {
+#       "partitions": 3,
+#       "replication_factor": 1
+#     },
+#     ...
+#   }
+#
+# Why a single file and not one file per topic?
+#   - Atomic reads: one GET always returns a consistent view of all topics.
+#   - Simplicity: no need for a prefix scan on every Metadata request.
+#   - Tradeoff: concurrent creates from two brokers would race (last PUT wins).
+#     Acceptable for a single-broker cluster.
+
+TOPIC_CONFIG_KEY = "__topic_config/topics.json"
+
+# In-memory cache so we don't hit MinIO on every Metadata request.
+# Invalidated whenever put_topic_config() is called.
+_topic_config_cache: dict[str, dict] | None = None
+
+
+def get_topic_config() -> dict[str, dict]:
+    """
+    Return the full topic config dict from MinIO (or the in-memory cache).
+
+    Returns a dict:
+        { topic_name: {"partitions": int, "replication_factor": int}, ... }
+
+    Returns {} if no config object exists yet (first run).
+    """
+    global _topic_config_cache
+    if _topic_config_cache is not None:
+        return _topic_config_cache
+
+    client = get_client()
+    try:
+        resp = client.get_object(MINIO_BUCKET, TOPIC_CONFIG_KEY)
+        data = json.loads(resp.read().decode("utf-8"))
+        resp.close()
+        _topic_config_cache = data
+        log.info("MinIO: loaded topic config — %d topic(s): %s",
+                 len(data), list(data.keys()))
+        return data
+    except S3Error as exc:
+        if exc.code == "NoSuchKey":
+            log.info("MinIO: no topic config found — starting with empty registry")
+            _topic_config_cache = {}
+            return {}
+        log.warning("MinIO: could not read topic config: %s", exc)
+        return {}
+
+
+def put_topic_config(config: dict[str, dict]) -> None:
+    """
+    Persist the full topic config dict to MinIO and update the cache.
+
+    Call this whenever a topic is created or deleted.
+
+    Parameters
+    ----------
+    config : { topic_name: {"partitions": int, "replication_factor": int} }
+    """
+    global _topic_config_cache
+    client = get_client()
+    payload = json.dumps(config, indent=2).encode("utf-8")
+    client.put_object(
+        MINIO_BUCKET,
+        TOPIC_CONFIG_KEY,
+        io.BytesIO(payload),
+        length=len(payload),
+        content_type="application/json",
+    )
+    _topic_config_cache = config
+    log.info("MinIO: saved topic config — %d topic(s): %s",
+             len(config), list(config.keys()))
+
+
+def create_topic(topic: str, partitions: int, replication_factor: int = 1) -> None:
+    """
+    Register a topic in the MinIO topic config.
+
+    Idempotent: if the topic already exists with the same settings, no-op.
+    Raises ValueError if the topic exists with *different* settings.
+    """
+    config = get_topic_config()
+    if topic in config:
+        existing = config[topic]
+        if existing["partitions"] == partitions:
+            log.info("Topic %r already exists with %d partition(s) — no-op",
+                     topic, partitions)
+            return
+        raise ValueError(
+            f"Topic {topic!r} already exists with {existing['partitions']} "
+            f"partition(s); refusing to overwrite (delete it first)."
+        )
+    config[topic] = {"partitions": partitions, "replication_factor": replication_factor}
+    put_topic_config(config)
+    log.info("Created topic %r  partitions=%d  replication_factor=%d",
+             topic, partitions, replication_factor)

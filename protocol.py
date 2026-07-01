@@ -402,9 +402,14 @@ def parse_metadata_request_topics(payload: bytes, header_size: int) -> list[str]
 # Metadata response builder
 # ---------------------------------------------------------------------------
 
-def build_metadata_response(correlation_id: int, topics: list[str], api_version: int = 0) -> bytes:
+def build_metadata_response(
+    correlation_id: int,
+    topics: list[str],
+    api_version: int = 0,
+    topic_config: dict[str, dict] | None = None,
+) -> bytes:
     """
-    Build a complete, framed Metadata v0 response.
+    Build a complete, framed Metadata response.
 
     Binary layout (v0):
     ┌─────────────┬───────────────────────────┬──────────────────────────────┐
@@ -432,10 +437,27 @@ def build_metadata_response(correlation_id: int, topics: list[str], api_version:
     correlation_id:
         Copied from the request; lets the client match response to request.
     topics:
-        List of topic names to include.  For each, we claim broker 1 is the
-        leader of partition 0.  If empty, the topics array in the response
-        will also be empty (client asked for "all topics" but we have none).
+        List of topic names to include.  Empty list = client asked for all
+        topics (we return whatever is in topic_config).
+    api_version:
+        Metadata API version (v0 vs v1 differ in is_internal field and
+        controller_id placement).
+    topic_config:
+        Dict of { topic_name: {"partitions": int, ...} } loaded from MinIO.
+        If None or a topic is missing, defaults to 1 partition as a safe
+        fallback (preserves backward compatibility with existing tests).
     """
+    if topic_config is None:
+        topic_config = {}
+
+    # Resolve which topics to include in the response:
+    #   - empty request → return all known topics from config
+    #   - specific request → return only the requested topics
+    if not topics:
+        topics_to_return = list(topic_config.keys())
+    else:
+        topics_to_return = topics
+
     # ── Response header ──────────────────────────────────────────────────────
     resp_header = struct.pack(">i", correlation_id)
 
@@ -461,27 +483,31 @@ def build_metadata_response(correlation_id: int, topics: list[str], api_version:
         controller_block = struct.pack(">i", BROKER_NODE_ID)
 
     # ── Topics section ───────────────────────────────────────────────────────
-    if not topics:
-        # Client requested all topics; we have none yet.
+    if not topics_to_return:
+        # Client requested all topics but we have none registered yet.
         topic_bytes = struct.pack(">i", 0)  # empty array
     else:
-        topic_bytes = struct.pack(">i", len(topics))
+        topic_bytes = struct.pack(">i", len(topics_to_return))
 
-        for topic_name in topics:
+        for topic_name in topics_to_return:
             topic_b = topic_name.encode("utf-8")
+            num_partitions = topic_config.get(topic_name, {}).get("partitions", 1)
 
-            # Partition entry is the same across v0 and v1.
+            # Build one partition entry per partition index.
+            # We are leader, sole replica, and sole ISR for all partitions.
             # Wire: [part_err][part_id][leader][replica_count][replica_0][isr_count][isr_0]
             #         int16    int32    int32      int32          int32      int32     int32
-            partition = (
-                struct.pack(">h", 0)                   # partition error_code = 0
-                + struct.pack(">i", 0)                 # partition_id = 0
-                + struct.pack(">i", BROKER_NODE_ID)    # leader = us
-                + struct.pack(">i", 1)                 # replicas: 1 entry
-                + struct.pack(">i", BROKER_NODE_ID)    # replica[0] = us
-                + struct.pack(">i", 1)                 # isr: 1 entry
-                + struct.pack(">i", BROKER_NODE_ID)    # isr[0] = us
-            )
+            all_partitions_bytes = b""
+            for part_id in range(num_partitions):
+                all_partitions_bytes += (
+                    struct.pack(">h", 0)                   # partition error_code = 0
+                    + struct.pack(">i", part_id)           # partition_id
+                    + struct.pack(">i", BROKER_NODE_ID)    # leader = us
+                    + struct.pack(">i", 1)                 # replicas: 1 entry
+                    + struct.pack(">i", BROKER_NODE_ID)    # replica[0] = us
+                    + struct.pack(">i", 1)                 # isr: 1 entry
+                    + struct.pack(">i", BROKER_NODE_ID)    # isr[0] = us
+                )
 
             # Topic entry fields differ by version.
             # v0: error_code | name | [partitions]
@@ -493,11 +519,12 @@ def build_metadata_response(correlation_id: int, topics: list[str], api_version:
             if api_version >= 1:
                 # is_internal BOOLEAN: false (0x00) for all user topics
                 topic_entry += struct.pack(">?", False)
-            topic_entry += struct.pack(">i", 1) + partition   # 1 partition
+            topic_entry += struct.pack(">i", num_partitions) + all_partitions_bytes
             topic_bytes += topic_entry
 
     payload = resp_header + brokers + controller_block + topic_bytes
     return build_frame(payload)
+
 
 
 # ---------------------------------------------------------------------------

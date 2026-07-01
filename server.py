@@ -161,11 +161,14 @@ async def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
         )
 
     if header.api_key == 3:   # Metadata
+        from storage import get_topic_config
         topics = parse_metadata_request_topics(payload, header.header_size)
+        topic_config = get_topic_config()
         return build_metadata_response(
             correlation_id=header.correlation_id,
             topics=topics,
             api_version=header.api_version,
+            topic_config=topic_config,
         )
 
     if header.api_key == 0:   # Produce
