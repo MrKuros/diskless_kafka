@@ -331,11 +331,24 @@ def build_api_versions_response(correlation_id: int, api_version: int) -> bytes:
 # of every partition of every topic.
 #
 # In a real cluster these values come from the broker's config file and from
-# ZooKeeper/KRaft consensus.  Here we just hard-code them.
+# ZooKeeper/KRaft consensus.
 
-BROKER_NODE_ID: int   = 1
-BROKER_HOST:    bytes = b"localhost"
-BROKER_PORT:    int   = 9092
+import os
+
+BROKER_NODE_ID: int   = int(os.getenv("BROKER_NODE_ID", "1"))
+BROKER_HOST:    bytes = os.getenv("BROKER_HOST", "localhost").encode("utf-8")
+BROKER_PORT:    int   = int(os.getenv("BROKER_PORT", "9092"))
+
+# Format: "1:localhost:9092,2:localhost:9093"
+CLUSTER_BROKERS_ENV = os.getenv("CLUSTER_BROKERS", "1:localhost:9092")
+CLUSTER_BROKERS: list[tuple[int, bytes, int]] = []
+for broker_str in CLUSTER_BROKERS_ENV.split(","):
+    parts = broker_str.split(":")
+    if len(parts) == 3:
+        CLUSTER_BROKERS.append((int(parts[0]), parts[1].encode("utf-8"), int(parts[2])))
+    else:
+        # Default fallback if parsing fails
+        CLUSTER_BROKERS = [(BROKER_NODE_ID, BROKER_HOST, BROKER_PORT)]
 
 
 # ---------------------------------------------------------------------------
@@ -464,23 +477,28 @@ def build_metadata_response(
     # ── Brokers section ──────────────────────────────────────────────────────
     # v0: node_id | host | port
     # v1: node_id | host | port | rack (NULLABLE_STRING, -1 = NULL)
-    broker_entry = (
-        struct.pack(">i", BROKER_NODE_ID)                  # node_id
-        + struct.pack(">h", len(BROKER_HOST)) + BROKER_HOST  # host
-        + struct.pack(">i", BROKER_PORT)                   # port
-    )
-    if api_version >= 1:
-        # rack: ff ff = int16(-1) = NULL (no rack assignment)
-        broker_entry += struct.pack(">h", -1)
-    brokers = struct.pack(">i", 1) + broker_entry  # array count=1
+    brokers_bytes = b""
+    for node_id, host_b, port in CLUSTER_BROKERS:
+        broker_entry = (
+            struct.pack(">i", node_id)                     # node_id
+            + struct.pack(">h", len(host_b)) + host_b      # host
+            + struct.pack(">i", port)                      # port
+        )
+        if api_version >= 1:
+            # rack: ff ff = int16(-1) = NULL (no rack assignment)
+            broker_entry += struct.pack(">h", -1)
+        brokers_bytes += broker_entry
+    
+    brokers = struct.pack(">i", len(CLUSTER_BROKERS)) + brokers_bytes
 
     # ── controller_id (v1 only, sits between brokers array and topics array) ──
     # The "controller" is the broker that manages partition leader elections.
-    # In our single-node cluster, we are the controller.
-    # v0 has no controller_id field at all; v1 adds it as a standalone INT32.
+    # We arbitrarily set broker 1 as controller.
     controller_block = b""
     if api_version >= 1:
-        controller_block = struct.pack(">i", BROKER_NODE_ID)
+        # Assuming broker 1 is the controller
+        controller_id = CLUSTER_BROKERS[0][0] if CLUSTER_BROKERS else BROKER_NODE_ID
+        controller_block = struct.pack(">i", controller_id)
 
     # ── Topics section ───────────────────────────────────────────────────────
     if not topics_to_return:
@@ -494,19 +512,21 @@ def build_metadata_response(
             num_partitions = topic_config.get(topic_name, {}).get("partitions", 1)
 
             # Build one partition entry per partition index.
-            # We are leader, sole replica, and sole ISR for all partitions.
             # Wire: [part_err][part_id][leader][replica_count][replica_0][isr_count][isr_0]
             #         int16    int32    int32      int32          int32      int32     int32
             all_partitions_bytes = b""
             for part_id in range(num_partitions):
+                # Dynamically assign leadership to split partitions across cluster
+                leader_node_id = CLUSTER_BROKERS[part_id % len(CLUSTER_BROKERS)][0]
+
                 all_partitions_bytes += (
                     struct.pack(">h", 0)                   # partition error_code = 0
                     + struct.pack(">i", part_id)           # partition_id
-                    + struct.pack(">i", BROKER_NODE_ID)    # leader = us
+                    + struct.pack(">i", leader_node_id)    # leader
                     + struct.pack(">i", 1)                 # replicas: 1 entry
-                    + struct.pack(">i", BROKER_NODE_ID)    # replica[0] = us
+                    + struct.pack(">i", leader_node_id)    # replica[0] = leader
                     + struct.pack(">i", 1)                 # isr: 1 entry
-                    + struct.pack(">i", BROKER_NODE_ID)    # isr[0] = us
+                    + struct.pack(">i", leader_node_id)    # isr[0] = leader
                 )
 
             # Topic entry fields differ by version.

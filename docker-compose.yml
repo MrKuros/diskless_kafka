@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio_data:/data
+
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=kafka
+      - POSTGRES_PASSWORD=kafka
+      - POSTGRES_DB=diskless_kafka
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  broker-1:
+    build: .
+    ports:
+      - "9092:9092"
+    environment:
+      - BROKER_NODE_ID=1
+      - BROKER_HOST=localhost
+      - BROKER_PORT=9092
+      - MINIO_ENDPOINT=minio:9000
+      - POSTGRES_DSN=postgresql://kafka:kafka@postgres:5432/diskless_kafka
+      - CLUSTER_BROKERS=1:localhost:9092,2:localhost:9093
+    depends_on:
+      - minio
+      - postgres
+
+  broker-2:
+    build: .
+    ports:
+      - "9093:9092"
+    environment:
+      - BROKER_NODE_ID=2
+      - BROKER_HOST=localhost
+      - BROKER_PORT=9093
+      - MINIO_ENDPOINT=minio:9000
+      - POSTGRES_DSN=postgresql://kafka:kafka@postgres:5432/diskless_kafka
+      - CLUSTER_BROKERS=1:localhost:9092,2:localhost:9093
+    depends_on:
+      - minio
+      - postgres
+
+volumes:
+  minio_data:
+  postgres_data:

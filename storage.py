@@ -39,11 +39,13 @@ log = logging.getLogger("kafka.storage")
 # ---------------------------------------------------------------------------
 # Connection settings — edit these to match your MinIO instance
 # ---------------------------------------------------------------------------
-MINIO_ENDPOINT   = "localhost:9000"
-MINIO_ACCESS_KEY = "minioadmin"
-MINIO_SECRET_KEY = "minioadmin"
-MINIO_BUCKET     = "diskless-kafka"
-MINIO_SECURE     = False      # False = plain HTTP; True = HTTPS
+import os
+
+MINIO_ENDPOINT   = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+MINIO_BUCKET     = os.getenv("MINIO_BUCKET", "diskless-kafka")
+MINIO_SECURE     = os.getenv("MINIO_SECURE", "0").lower() in ("1", "true")
 
 # ---------------------------------------------------------------------------
 # Lazy-initialised MinIO client

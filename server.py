@@ -46,8 +46,9 @@ from protocol import (
 )
 from storage import commit_offset, load_committed_offsets, write_batch
 
-HOST = "0.0.0.0"
-PORT = 9092
+import os
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "9092"))
 
 # ---------------------------------------------------------------------------
 # Logging setup — one line per event, timestamps included
