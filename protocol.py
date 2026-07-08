@@ -1,8 +1,11 @@
 """
 diskless_kafka/protocol.py
 ──────────────────────────
-Day 5: Parse the Kafka request header + encode ApiVersions/Metadata responses
-       + parse Produce requests and RecordBatch contents.
+Kafka wire protocol parsing and encoding utilities.
+
+This module handles serialization and deserialization of the binary Kafka 
+protocol (v0-v4), including RequestHeaders, Produce/Fetch requests, 
+Metadata, and Consumer Group coordination APIs.
 
 Kafka wire format (Request Header v0 / v1):
 ──────────────────────────────────────────
@@ -302,6 +305,12 @@ def build_api_versions_response(correlation_id: int, api_version: int) -> bytes:
     # ── Response body (version-dependent) ───────────────────────────────────
     error_code = 0  # 0 = no error
 
+    if api_version > 2:
+        # If client requests v3+, we don't support flexible versions yet.
+        # Protocol dictates we must return UNSUPPORTED_VERSION (35) in v0 format.
+        api_version = 0
+        error_code = 35
+
     if api_version == 0:
         # v0: error_code + array (no throttle field)
         resp_body = struct.pack(">h", error_code) + api_array
@@ -420,48 +429,23 @@ def build_metadata_response(
     topics: list[str],
     api_version: int = 0,
     topic_config: dict[str, dict] | None = None,
+    partition_leaders: dict[str, dict[int, int]] | None = None,
 ) -> bytes:
     """
     Build a complete, framed Metadata response.
 
-    Binary layout (v0):
-    ┌─────────────┬───────────────────────────┬──────────────────────────────┐
-    │ corr_id     │ brokers array             │ topics array                 │
-    │ (int32)     │ [count][node_id host port]│ [count][err name partitions] │
-    └─────────────┴───────────────────────────┴──────────────────────────────┘
-
-    Broker entry (one per entry in brokers array):
-        node_id  INT32
-        host     STRING  (int16 length + UTF-8 bytes)
-        port     INT32
-
-    Topic entry:
-        error_code      INT16
-        name            STRING
-        partitions      ARRAY of:
-            error_code  INT16
-            partition   INT32   (partition index, 0-based)
-            leader      INT32   (node_id of the leader broker)
-            replicas    [INT32] (all brokers that have a copy)
-            isr         [INT32] (in-sync replicas — caught-up followers)
-
     Parameters
     ----------
-    correlation_id:
-        Copied from the request; lets the client match response to request.
-    topics:
-        List of topic names to include.  Empty list = client asked for all
-        topics (we return whatever is in topic_config).
-    api_version:
-        Metadata API version (v0 vs v1 differ in is_internal field and
-        controller_id placement).
-    topic_config:
-        Dict of { topic_name: {"partitions": int, ...} } loaded from MinIO.
-        If None or a topic is missing, defaults to 1 partition as a safe
-        fallback (preserves backward compatibility with existing tests).
+    correlation_id: Copied from the request.
+    topics: List of topic names to include.
+    api_version: Metadata API version.
+    topic_config: Dict of { topic_name: {"partitions": int, ...} }
+    partition_leaders: Dict of { topic_name: { partition_id: leader_id } }
     """
     if topic_config is None:
         topic_config = {}
+    if partition_leaders is None:
+        partition_leaders = {}
 
     # Resolve which topics to include in the response:
     #   - empty request → return all known topics from config
@@ -493,7 +477,6 @@ def build_metadata_response(
 
     # ── controller_id (v1 only, sits between brokers array and topics array) ──
     # The "controller" is the broker that manages partition leader elections.
-    # We arbitrarily set broker 1 as controller.
     controller_block = b""
     if api_version >= 1:
         # Assuming broker 1 is the controller
@@ -502,7 +485,6 @@ def build_metadata_response(
 
     # ── Topics section ───────────────────────────────────────────────────────
     if not topics_to_return:
-        # Client requested all topics but we have none registered yet.
         topic_bytes = struct.pack(">i", 0)  # empty array
     else:
         topic_bytes = struct.pack(">i", len(topics_to_return))
@@ -516,17 +498,31 @@ def build_metadata_response(
             #         int16    int32    int32      int32          int32      int32     int32
             all_partitions_bytes = b""
             for part_id in range(num_partitions):
-                # Dynamically assign leadership to split partitions across cluster
-                leader_node_id = CLUSTER_BROKERS[part_id % len(CLUSTER_BROKERS)][0]
+                leader_node_id = partition_leaders.get(topic_name, {}).get(part_id)
+                
+                if leader_node_id is None:
+                    # LEADER_NOT_AVAILABLE (5)
+                    part_err = 5
+                    leader_node_id = -1
+                    replica_count = 0
+                    replicas = b""
+                    isr_count = 0
+                    isrs = b""
+                else:
+                    part_err = 0
+                    replica_count = 1
+                    replicas = struct.pack(">i", leader_node_id)
+                    isr_count = 1
+                    isrs = struct.pack(">i", leader_node_id)
 
                 all_partitions_bytes += (
-                    struct.pack(">h", 0)                   # partition error_code = 0
+                    struct.pack(">h", part_err)            # partition error_code
                     + struct.pack(">i", part_id)           # partition_id
                     + struct.pack(">i", leader_node_id)    # leader
-                    + struct.pack(">i", 1)                 # replicas: 1 entry
-                    + struct.pack(">i", leader_node_id)    # replica[0] = leader
-                    + struct.pack(">i", 1)                 # isr: 1 entry
-                    + struct.pack(">i", leader_node_id)    # isr[0] = leader
+                    + struct.pack(">i", replica_count)     # replica_count
+                    + replicas                             # replica array
+                    + struct.pack(">i", isr_count)         # isr_count
+                    + isrs                                 # isr array
                 )
 
             # Topic entry fields differ by version.

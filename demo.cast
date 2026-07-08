@@ -1,0 +1,12 @@
+{"version": 2, "width": 80, "height": 24, "timestamp": 1783490822, "env": {"SHELL": "/usr/bin/fish", "TERM": "dumb"}}
+[0.111617, "o", "$ docker compose up -d\r\n"]
+[3.836269, "o", "[+] Network diskless_kafka_default           Created\r\n[+] Container diskless_kafka-postgres-1      Started\r\n[+] Container diskless_kafka-minio-1         Started\r\n[+] Container diskless_kafka-broker-1-1      Started\r\n[+] Container diskless_kafka-broker-2-1      Started\r\n\r\n$ python3 producer.py &\r\nProducer started...\r\n"]
+[6.837474, "o", "\r\n$ python3 consumer.py &\r\nConsumer started...\r\n"]
+[8.257446, "o", "[Producer] Sent 30 messages...\r\n"]
+[10.838326, "o", "\r\n$ docker compose kill broker-2\r\n"]
+[11.145161, "o", "[+] Container diskless_kafka-broker-2-1  Killed\r\n[System] Waiting for background heartbeat sweep to detect node failure (10s timeout)...\r\n"]
+[12.773544, "o", "[Producer] Sent 60 messages...\r\n"]
+[17.284152, "o", "[Producer] Sent 90 messages...\r\n"]
+[21.798226, "o", "[Producer] Sent 120 messages...\r\n"]
+[26.306921, "o", "[Producer] Sent 150 messages...\r\n"]
+[33.930469, "o", "[Producer] Finished sending 150 messages.\r\n"]

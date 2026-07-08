@@ -1,21 +1,11 @@
 """
 diskless_kafka/server.py
 ────────────────────────
-Day 6: Write RecordBatch to MinIO and send a proper Produce response.
+The main entry point for the diskless Kafka broker.
 
-For each incoming frame:
-  1. Read the 4-byte length prefix
-  2. Read exactly that many payload bytes
-  3. Log the raw hex dump
-  4. Parse the request header (api_key, api_version, correlation_id, client_id)
-  5. Dispatch to the matching handler
-  6. Write the encoded response back to the client
-
-Run:
-    python server.py
-
-Test:
-    python test_client.py
+This module sets up an asyncio server that listens for Kafka client connections.
+It parses incoming requests using protocol.py, fetches or writes data to MinIO
+using storage.py, and coordinates cluster metadata and leadership via db.py.
 """
 
 import asyncio
@@ -44,7 +34,8 @@ from protocol import (
     parse_records_in_batch,
     parse_request_header,
 )
-from storage import commit_offset, load_committed_offsets, write_batch
+from storage import commit_offset, load_committed_offsets, write_batch, get_topic_config
+from db import init_db, heartbeat, usurp_dead_brokers, claim_partition, get_partition_leaders
 
 import os
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -162,14 +153,18 @@ async def dispatch(header: RequestHeader, payload: bytes) -> bytes | None:
         )
 
     if header.api_key == 3:   # Metadata
-        from storage import get_topic_config
         topics = parse_metadata_request_topics(payload, header.header_size)
         topic_config = get_topic_config()
+        
+        # Read current dynamic cluster leadership from Postgres
+        partition_leaders = await asyncio.to_thread(get_partition_leaders)
+        
         return build_metadata_response(
             correlation_id=header.correlation_id,
             topics=topics,
             api_version=header.api_version,
             topic_config=topic_config,
+            partition_leaders=partition_leaders,
         )
 
     if header.api_key == 0:   # Produce
@@ -1085,12 +1080,60 @@ async def handle_connection(
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+async def heartbeat_and_claim_loop():
+    """
+    Background task to maintain cluster leadership via Postgres.
+    """
+    from protocol import BROKER_NODE_ID
+    while True:
+        try:
+            # 1. Update our heartbeat
+            await asyncio.to_thread(heartbeat, BROKER_NODE_ID)
+            
+            # 2. Reap dead brokers (if they haven't heartbeated in 10s)
+            await asyncio.to_thread(usurp_dead_brokers, 10)
+            
+            # 3. Try to claim any leaderless partitions
+            config = get_topic_config()
+            
+            # Figure out cluster size from CLUSTER_BROKERS
+            cluster_brokers = os.getenv("CLUSTER_BROKERS", "")
+            cluster_size = len(cluster_brokers.split(",")) if cluster_brokers else 1
+            
+            for topic, tconfig in config.items():
+                for part_id in range(tconfig.get("partitions", 1)):
+                    preferred_broker_id = (part_id % cluster_size) + 1
+                    
+                    # We always try to claim if we are the preferred broker.
+                    # If we are not preferred, we wait. Wait, if it's leaderless (NULL), 
+                    # we should be able to claim it. The db claim_partition handles this.
+                    # Let's just pass a flag or only try to claim our preferred ones, 
+                    # AND any that are currently NULL. 
+                    # Actually, the simplest is:
+                    # Try to claim. If the row doesn't exist, the DB INSERT will succeed.
+                    # We want to ONLY INSERT if we are the preferred broker.
+                    # If the row DOES exist and leader is NULL, any broker can UPDATE it.
+                    # Let's handle this in the Python side or just let DB do it.
+                    await asyncio.to_thread(claim_partition, topic, part_id, BROKER_NODE_ID, preferred_broker_id)
+                    
+        except Exception as e:
+            log.error("Failover loop error: %s", e)
+            
+        await asyncio.sleep(3)
+
+
 async def main() -> None:
-    # ── Load persisted committed offsets from MinIO before accepting connections
+    # Initialize the database schema
+    await asyncio.to_thread(init_db)
+    
+    # Load topic config into cache
+    get_topic_config()
+    
+    # Load offsets into memory
     global COMMITTED_OFFSETS
     log.info("Loading committed offsets from MinIO …")
     try:
-        COMMITTED_OFFSETS = load_committed_offsets()
+        COMMITTED_OFFSETS = await asyncio.to_thread(load_committed_offsets)
     except Exception as exc:
         log.warning("Could not load committed offsets from MinIO: %s", exc)
         COMMITTED_OFFSETS = {}
@@ -1106,7 +1149,10 @@ async def main() -> None:
     log.info("waiting for connections …")
 
     async with server:
+        # Start background task for cluster heartbeat
+        hb_task = asyncio.create_task(heartbeat_and_claim_loop())
         await server.serve_forever()
+        hb_task.cancel()
 
 
 if __name__ == "__main__":

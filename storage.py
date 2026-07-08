@@ -1,16 +1,12 @@
 """
 diskless_kafka/storage.py
 ─────────────────────────
-Day 7: MinIO-backed batch store — write (Day 6) + read (Day 7).
+MinIO-backed batch storage and topic configuration layer.
 
-Every RecordBatch that arrives in a Produce request is written verbatim to
-MinIO under the object key:
-
-    {topic}/{partition}/{base_offset:020d}.batch
-
-The 20-digit zero-padded base_offset ensures that lexicographic sort of object
-keys equals numeric (log) order — crucial when the Fetch handler lists the
-bucket to reconstruct the partition log.
+Brokers use this module to read and write entire RecordBatches as single 
+objects in MinIO using a zero-padded lexicographic key format. This module
+also handles reading static topic configuration and caching current high 
+watermarks in memory to prevent unnecessary MinIO bucket list operations.
 
 Why the entire RecordBatch, not individual records?
   • CRC32C integrity is preserved end-to-end (producer → MinIO → consumer).
@@ -26,6 +22,7 @@ Configuration (change these to match your MinIO instance):
 """
 
 from __future__ import annotations
+import time
 
 import io
 import json
@@ -115,7 +112,7 @@ def write_batch(topic: str, partition: int, record_set: bytes, records_count: in
     Example:  test-topic/0/00000000000000000000.batch
     """
     key = (topic, partition)
-    base_offset = _next_offset.get(key, 0)
+    base_offset = _get_or_recover_hw(topic, partition)
 
     # Zero-padded offset → lexicographic sort == log order
     object_key = f"{topic}/{partition}/{base_offset:020d}.batch"
@@ -163,6 +160,49 @@ def write_batch(topic: str, partition: int, record_set: bytes, records_count: in
 #   When _next_offset is 0 (broker just started), scan the last batch to
 #   get records_count and recompute high_watermark.  This means the consumer
 #   can reconnect after a broker restart without data loss.
+
+
+def _get_or_recover_hw(topic: str, partition: int) -> int:
+    key = (topic, partition)
+    hw = _next_offset.get(key, 0)
+    if hw > 0:
+        return hw
+
+    client = get_client()
+    prefix = f"{topic}/{partition}/"
+    try:
+        objects = list(client.list_objects(MINIO_BUCKET, prefix=prefix))
+    except Exception as exc:
+        log.error("MinIO list error for %r: %s", prefix, exc)
+        return 0
+
+    batches = []
+    for obj in objects:
+        filename = obj.object_name.split("/")[-1]
+        if not filename.endswith(".batch"):
+            continue
+        try:
+            batches.append((int(filename[:-6]), obj.object_name))
+        except ValueError:
+            continue
+
+    if not batches:
+        return 0
+
+    batches.sort()
+    last_base, last_obj_key = batches[-1]
+    try:
+        resp = client.get_object(MINIO_BUCKET, last_obj_key)
+        last_bytes = resp.read()
+        resp.close()
+        records_count = struct.unpack_from(">i", last_bytes, 57)[0]
+        hw = last_base + records_count
+        _next_offset[key] = hw
+        log.info("MinIO: recovered hw=%d for %s/%d from object listing", hw, topic, partition)
+        return hw
+    except Exception as exc:
+        log.warning("MinIO: HW recovery failed for %r: %s", last_obj_key, exc)
+        return 0
 
 def read_batch(
     topic: str,
@@ -212,25 +252,7 @@ def read_batch(
 
     batches.sort()   # ascending by base_offset (lexicographic == numeric)
 
-    # ── Reconstruct high_watermark if broker just restarted ───────────────────
-    key = (topic, partition)
-    hw  = _next_offset.get(key, 0)
-
-    if hw == 0:
-        # Read the last batch's header to get records_count and recompute HW.
-        last_base, last_obj_key = batches[-1]
-        try:
-            resp = client.get_object(MINIO_BUCKET, last_obj_key)
-            last_bytes = resp.read()
-            resp.close()
-            # RecordBatch header: records_count at bytes 57-60 (INT32)
-            records_count = struct.unpack_from(">i", last_bytes, 57)[0]
-            hw = last_base + records_count
-            _next_offset[key] = hw   # cache for future calls
-            log.info("MinIO: recovered hw=%d for %s/%d from object listing",
-                     hw, topic, partition)
-        except Exception as exc:
-            log.warning("MinIO: HW recovery failed for %r: %s", last_obj_key, exc)
+    hw = _get_or_recover_hw(topic, partition)
 
     # ── Nothing to return if consumer is already caught up ────────────────────
     if fetch_offset >= hw:
@@ -404,7 +426,8 @@ TOPIC_CONFIG_KEY = "__topic_config/topics.json"
 
 # In-memory cache so we don't hit MinIO on every Metadata request.
 # Invalidated whenever put_topic_config() is called.
-_topic_config_cache: dict[str, dict] | None = None
+TOPIC_CONFIG_CACHE: dict[str, dict] | None = None
+_TOPIC_CONFIG_LAST_LOAD = 0.0
 
 
 def get_topic_config() -> dict[str, dict]:
@@ -416,23 +439,27 @@ def get_topic_config() -> dict[str, dict]:
 
     Returns {} if no config object exists yet (first run).
     """
-    global _topic_config_cache
-    if _topic_config_cache is not None:
-        return _topic_config_cache
+    global TOPIC_CONFIG_CACHE, _TOPIC_CONFIG_LAST_LOAD
+    now = time.time()
+    
+    if TOPIC_CONFIG_CACHE is not None and (now - _TOPIC_CONFIG_LAST_LOAD < 5.0):
+        return TOPIC_CONFIG_CACHE
 
     client = get_client()
     try:
         resp = client.get_object(MINIO_BUCKET, TOPIC_CONFIG_KEY)
         data = json.loads(resp.read().decode("utf-8"))
         resp.close()
-        _topic_config_cache = data
+        TOPIC_CONFIG_CACHE = data
+        _TOPIC_CONFIG_LAST_LOAD = now
         log.info("MinIO: loaded topic config — %d topic(s): %s",
                  len(data), list(data.keys()))
         return data
     except S3Error as exc:
         if exc.code == "NoSuchKey":
             log.info("MinIO: no topic config found — starting with empty registry")
-            _topic_config_cache = {}
+            TOPIC_CONFIG_CACHE = {}
+            _TOPIC_CONFIG_LAST_LOAD = now
             return {}
         log.warning("MinIO: could not read topic config: %s", exc)
         return {}
@@ -448,17 +475,18 @@ def put_topic_config(config: dict[str, dict]) -> None:
     ----------
     config : { topic_name: {"partitions": int, "replication_factor": int} }
     """
-    global _topic_config_cache
+    global TOPIC_CONFIG_CACHE, _TOPIC_CONFIG_LAST_LOAD
     client = get_client()
-    payload = json.dumps(config, indent=2).encode("utf-8")
+    data_bytes = json.dumps(config).encode("utf-8")
     client.put_object(
         MINIO_BUCKET,
         TOPIC_CONFIG_KEY,
-        io.BytesIO(payload),
-        length=len(payload),
-        content_type="application/json",
+        io.BytesIO(data_bytes),
+        len(data_bytes),
+        content_type="application/json"
     )
-    _topic_config_cache = config
+    TOPIC_CONFIG_CACHE = config
+    _TOPIC_CONFIG_LAST_LOAD = time.time()
     log.info("MinIO: saved topic config — %d topic(s): %s",
              len(config), list(config.keys()))
 
