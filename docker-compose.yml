@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   minio:
     image: minio/minio
@@ -23,6 +21,13 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # Brokers run init_db() once at startup; gate them on Postgres being ready
+    # or the tables never get created (cold-start race).
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kafka -d diskless_kafka"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
 
   broker-1:
     build: .
@@ -36,8 +41,10 @@ services:
       - POSTGRES_DSN=postgresql://kafka:kafka@postgres:5432/diskless_kafka
       - CLUSTER_BROKERS=1:localhost:9092,2:localhost:9093
     depends_on:
-      - minio
-      - postgres
+      minio:
+        condition: service_started
+      postgres:
+        condition: service_healthy
 
   broker-2:
     build: .
@@ -51,8 +58,10 @@ services:
       - POSTGRES_DSN=postgresql://kafka:kafka@postgres:5432/diskless_kafka
       - CLUSTER_BROKERS=1:localhost:9092,2:localhost:9093
     depends_on:
-      - minio
-      - postgres
+      minio:
+        condition: service_started
+      postgres:
+        condition: service_healthy
 
 volumes:
   minio_data:

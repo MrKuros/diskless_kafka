@@ -11,13 +11,23 @@ Brokers here are stateless networking proxies. Every message batch is flushed di
 ### Why this is interesting
 * **Standard Kafka clients work unmodified**: You don't need to adopt a new SDK; existing Kafka integrations work out of the box.
 * **Kill any broker, restart anywhere, zero data loss**: Because brokers are entirely stateless, they can crash or be rescheduled without rebalancing a single byte. On restart, a broker issues one `ListObjects` call to MinIO and fully recovers its high-watermark.
-* **The future of Apache Kafka**: This architecture cleanly separates compute from storage, proving out the design that [KIP-1150](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1150%3A+Write+Kafka+Data+Directly+to+S3) and vendors like WarpStream are bringing to the Kafka ecosystem.
+* **The future of Apache Kafka**: This architecture cleanly separates compute from storage, proving out the design that [KIP-1150](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1150%3A+Write+Kafka+Data+Directly+to+S3) is bringing to the Kafka ecosystem.
 
 ## Quickstart
 
-Start the infrastructure (MinIO, Postgres, and two stateless brokers):
+One command brings up the infrastructure (MinIO, Postgres, two stateless brokers), produces, and consumes:
+```bash
+./run.sh
+```
+
+Or run the steps by hand. Start the infrastructure:
 ```bash
 docker compose up -d
+```
+
+Register the demo topic (topics must exist before producing; `create_topic.py` runs on the host, so point it at MinIO's published port):
+```bash
+MINIO_ENDPOINT=localhost:9010 python create_topic.py demo-topic 2
 ```
 
 Produce 1000 messages using the standard Kafka client:
@@ -82,14 +92,6 @@ The broker implements the full Kafka consumer group protocol so that unmodified 
 3. **Heartbeat loop** — Consumers heartbeat every 3s. Heartbeats carry a `generation_id`; if it doesn't match, the broker returns `ILLEGAL_GENERATION` and the consumer rejoins. This is how rebalances are detected.
 
 The leader does assignment rather than the broker because the broker doesn't need to know about assignment strategies. New strategies can be added client-side without any broker changes.
-
-## Comparison to WarpStream
-
-WarpStream and this project start from the same insight: write messages directly to S3, make brokers stateless. The data path is identical.
-
-The difference is the metadata layer. WarpStream runs a purpose-built distributed metadata service (backed by something like etcd or DynamoDB) that's designed for multi-region, high-availability coordination. This project uses PostgreSQL — a single node, but one whose ACID semantics prevent split-brain, and whose logic you can read in eight lines of SQL.
-
-PostgreSQL is a single point of failure; a distributed metadata store is not. That's the honest trade-off.
 
 ## Architecture & Internals
 
