@@ -20,15 +20,15 @@ for i in $(seq 1 30); do
 done
 
 # Topics must be registered before producing, else messages route nowhere.
-# create_topic.py runs on the host, so it needs MinIO's published port (9010->9000).
+# examples/create_topic.py runs on the host, so it needs MinIO's published port (9010->9000).
 echo "==> Registering 'demo-topic'..."
-MINIO_ENDPOINT=localhost:9010 "$PY" create_topic.py demo-topic 2 || true
+MINIO_ENDPOINT=localhost:9010 "$PY" examples/create_topic.py demo-topic 2 || true
 
 # Brokers refresh the topic config from MinIO on a 5s cache; wait it out.
 sleep 6
 
 echo "==> Producing..."
-"$PY" producer.py
+"$PY" examples/producer.py
 
 echo "==> Consuming..."
-"$PY" consumer.py
+"$PY" examples/consumer.py

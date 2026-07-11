@@ -1,6 +1,6 @@
 """
-diskless_kafka/benchmark.py
-───────────────────────────
+examples/benchmark.py
+─────────────────────
 Comprehensive benchmark for the diskless Kafka broker. Covers:
 
   1. Producer throughput   — msgs/s and MB/s for 100B, 1KB, 10KB payloads
@@ -26,6 +26,9 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+# Run from anywhere: put the repo root (parent of examples/) on the import path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from kafka import KafkaConsumer, KafkaProducer
 from kafka import TopicPartition
 from kafka.errors import NoBrokersAvailable, KafkaError
@@ -48,27 +51,27 @@ HEARTBEAT_TIMEOUT_SEC = 10
 
 # ─── Topic helpers ─────────────────────────────────────────────────────────────
 
+def _object_store():
+    from config import Settings
+    from storage import ObjectStore
+    return ObjectStore(Settings.from_env())
+
+
 def _ensure_topic(topic: str, partitions: int = 2) -> None:
-    """Register a topic in MinIO's topic config (no-op if already exists)."""
-    from storage import get_topic_config, create_topic as _create
-    cfg = get_topic_config()
-    if topic not in cfg:
-        _create(topic, partitions, replication_factor=1)
+    """Register a topic in the object store's topic config (no-op if it exists)."""
+    store = _object_store()
+    if topic not in store.get_topic_config():
+        store.create_topic(topic, partitions, replication_factor=1)
         print(f"    ✓ created topic {topic!r} ({partitions} partitions)")
 
 
 def _clear_topic_data(topic: str) -> None:
-    """Delete all RecordBatch objects for a topic from MinIO."""
-    from storage import get_client, MINIO_BUCKET, _next_offset
-    client = get_client()
+    """Delete all RecordBatch objects for a topic from the object store."""
+    store = _object_store()
     try:
-        objs = list(client.list_objects(MINIO_BUCKET, prefix=f"{topic}/", recursive=True))
+        objs = list(store.client.list_objects(store.bucket, prefix=f"{topic}/", recursive=True))
         for obj in objs:
-            client.remove_object(MINIO_BUCKET, obj.object_name)
-        # Also wipe the in-process offset cache so the broker starts fresh
-        keys_to_del = [k for k in _next_offset if k[0] == topic]
-        for k in keys_to_del:
-            del _next_offset[k]
+            store.client.remove_object(store.bucket, obj.object_name)
     except Exception as exc:
         print(f"    [warn] MinIO clear failed for {topic!r}: {exc}")
 
